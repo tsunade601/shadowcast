@@ -3,7 +3,9 @@ FROM golang:1.21-alpine
 WORKDIR /app
 
 COPY go.mod ./
-RUN go mod download
+
+# Generate go.sum and download dependencies
+RUN go mod tidy && go mod download
 
 COPY . .
 

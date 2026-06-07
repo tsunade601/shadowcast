@@ -9,9 +9,7 @@
     "build": "tsc",
     "dev": "tsc --watch"
   },
-  "dependencies": {
-    "uuid": "^10.0.0"
-  },
+  "dependencies": {},
   "devDependencies": {
     "typescript": "^5.5.0"
   }
