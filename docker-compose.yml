@@ -1,0 +1,18 @@
+version: '3.8'
+
+services:
+  signaling:
+    build: ./signaling
+    ports:
+      - "8080:8080"
+    environment:
+      - PORT=8080
+
+  demo:
+    build: ./demo
+    ports:
+      - "3000:3000"
+    depends_on:
+      - signaling
+    environment:
+      - NEXT_PUBLIC_SIGNALING_URL=ws://localhost:8080

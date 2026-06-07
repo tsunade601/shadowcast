@@ -1,0 +1,18 @@
+{
+  "name": "shadowcast",
+  "version": "0.1.0",
+  "description": "P2P WebRTC asset delivery engine",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "files": ["dist"],
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsc --watch"
+  },
+  "dependencies": {
+    "uuid": "^10.0.0"
+  },
+  "devDependencies": {
+    "typescript": "^5.5.0"
+  }
+}

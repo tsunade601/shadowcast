@@ -1,1 +1,39 @@
-... full gitignore ...
+# Dependencies
+node_modules/
+**/node_modules/
+dist/
+build/
+*.log
+
+# Go
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+**/bin/
+**/pkg/
+
+# Environment
+.env
+.env.local
+.env.*.local
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Build outputs
+*.tsbuildinfo
+coverage/
+.nyc_output/
+
+# Demo specific
+demo/.next/
+demo/out/
