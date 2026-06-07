@@ -31,7 +31,7 @@ flowchart TD
 ## Quickstart
 
 ```bash
-git clone https://github.com/tsunade601/shadowcast.git
+git clone https://github.com/assishmoncs/shadowcast.git
 cd shadowcast
 
 # Start everything with Docker Compose
