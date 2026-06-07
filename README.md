@@ -48,4 +48,4 @@ Visit `http://localhost:3000` for the demo.
 
 ## License
 
-MIT © 2026 tsunade601
+MIT © 2026
