@@ -37,3 +37,6 @@ coverage/
 # Demo specific
 demo/.next/
 demo/out/
+
+# Local task tracking
+TODO.md

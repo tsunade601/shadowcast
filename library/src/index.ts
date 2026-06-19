@@ -1,25 +1,13 @@
 /**
  * ShadowCast - P2P WebRTC Asset Delivery Client
  * Vanilla TS, zero heavy deps.
- *
- * Fixed:
- *  - handleOffer / handleAnswer / handleIceCandidate implemented (Critical)
- *  - ondatachannel listener on answerer side (Critical)
- *  - Double-init / WebSocket leak guard (High)
- *  - fallbackToHttp actually fetches and caches the asset (High)
- *  - Removed unused uuidv4 import; use crypto.randomUUID() (Medium)
- *  - onerror handlers on WebSocket + DataChannel (Medium)
- *  - Full chunking + reassembly with hash verification (Medium)
- *  - init() returns a Promise that resolves only after WS is open (Medium)
  */
-
-// ---------- Types ----------
 
 interface Chunk {
   index: number;
   total: number;
   assetId: string;
-  data: string; // base64-encoded chunk payload
+  data: string;
 }
 
 interface ChunkBuffer {
@@ -28,56 +16,61 @@ interface ChunkBuffer {
   mimeType: string;
 }
 
-// ---------- Constants ----------
+interface PendingAsset {
+  url: string;
+  resolve: (url: string) => void;
+}
 
-const CHUNK_SIZE = 64 * 1024; // 64 KB per chunk
-
-// ---------- ShadowCast ----------
+const CHUNK_SIZE = 64 * 1024;
+const DEFAULT_ROOM = 'shadowcast-global';
 
 export class ShadowCast {
-  private peerId: string = crypto.randomUUID(); // Medium fix: no uuid dep
+  private peerId: string = crypto.randomUUID();
 
   private peers: Map<string, RTCPeerConnection> = new Map();
   private dataChannels: Map<string, RTCDataChannel> = new Map();
   private signalingWs: WebSocket | null = null;
   private assetCache: Map<string, Blob> = new Map();
   private roomId: string = '';
-  private initialized = false; // High fix: guard against double-init
+  private initialized = false;
+  private connectingPromise: Promise<void> | null = null;
 
-  // Reassembly buffers keyed by assetId
   private chunkBuffers: Map<string, ChunkBuffer> = new Map();
-
-  // Pending resolvers for requestAsset (assetId → resolve fn)
-  private assetResolvers: Map<string, (url: string) => void> = new Map();
+  private assetResolvers: Map<string, PendingAsset> = new Map();
+  private assetUrlsById: Map<string, string> = new Map();
+  private pendingChunkMeta: Map<string, { assetId: string; index: number }> = new Map();
+  private peerWaiters: Set<() => void> = new Set();
 
   constructor(private signalingUrl: string = 'ws://localhost:8080/ws') {}
 
-  // ---------- Init ----------
+  async init(roomId: string = DEFAULT_ROOM): Promise<void> {
+    return this.connect(roomId);
+  }
 
-  /**
-   * Connect to the signaling server and join the given room.
-   * Medium fix: returns a Promise that only resolves once the WS is open.
-   * High fix: guards against re-initializing if already connected.
-   */
-  async init(roomId: string): Promise<void> {
-    if (this.initialized && this.roomId === roomId) return; // High fix: no double-init
+  async connect(roomId: string = DEFAULT_ROOM): Promise<void> {
+    if (this.initialized && this.roomId === roomId && this.signalingWs?.readyState === WebSocket.OPEN) {
+      return;
+    }
 
-    // If already connected to a different room, close the old socket
-    if (this.signalingWs) {
-      this.signalingWs.close();
-      this.signalingWs = null;
+    if (this.connectingPromise && this.roomId === roomId) {
+      return this.connectingPromise;
+    }
+
+    if (this.signalingWs || this.peers.size > 0 || this.dataChannels.size > 0) {
+      this.cleanupMesh();
     }
 
     this.roomId = roomId;
     this.initialized = false;
 
-    return new Promise((resolve, reject) => {
+    this.connectingPromise = new Promise((resolve, reject) => {
       const ws = new WebSocket(this.signalingUrl);
       this.signalingWs = ws;
 
       ws.onopen = () => {
         ws.send(JSON.stringify({ type: 'join', room: roomId, from: this.peerId }));
         this.initialized = true;
+        this.connectingPromise = null;
         resolve();
       };
 
@@ -90,72 +83,91 @@ export class ShadowCast {
         }
       };
 
-      // Medium fix: onerror handler on WebSocket
       ws.onerror = (err) => {
-        console.error('[ShadowCast] WebSocket error:', err);
+        this.connectingPromise = null;
         reject(err);
       };
 
       ws.onclose = () => {
-        console.warn('[ShadowCast] WebSocket closed.');
         this.initialized = false;
+        this.connectingPromise = null;
       };
     });
+
+    return this.connectingPromise;
   }
 
-  // ---------- Signaling ----------
+  waitForPeers({ timeout = 5000 }: { timeout?: number } = {}): Promise<boolean> {
+    if (this.hasOpenDataChannel()) {
+      return Promise.resolve(true);
+    }
+
+    return new Promise((resolve) => {
+      const done = (ready: boolean) => {
+        clearTimeout(timer);
+        this.peerWaiters.delete(onPeerReady);
+        resolve(ready);
+      };
+
+      const onPeerReady = () => done(true);
+      const timer = setTimeout(() => done(false), timeout);
+      this.peerWaiters.add(onPeerReady);
+    });
+  }
 
   private async handleSignalingMessage(msg: Record<string, unknown>) {
     switch (msg.type) {
       case 'self-id':
-        // Server assigned us a canonical peer ID; overwrite the local one
         this.peerId = msg.id as string;
         break;
 
       case 'room-peers': {
-        // Server told us about existing peers in the room — initiate offers
         const peers = msg.peers as string[];
         for (const peerId of peers) {
-          if (peerId !== this.peerId) {
-            await this.initiateOffer(peerId);
-          }
+          await this.maybeInitiateOffer(peerId);
         }
         break;
       }
 
       case 'peer-joined':
-        // A new peer entered the room — they will send us an offer
-        console.log('[ShadowCast] Peer joined:', msg.id);
+        await this.maybeInitiateOffer(msg.id as string);
         break;
 
       case 'peer-left':
         this.handlePeerDisconnect(msg.id as string);
         break;
 
-      // Critical fix #1: implement offer handler
       case 'offer':
         await this.handleOffer(msg);
         break;
 
-      // Critical fix #1: implement answer handler
       case 'answer':
         await this.handleAnswer(msg);
         break;
 
-      // Critical fix #1: implement ICE candidate handler
       case 'ice-candidate':
         await this.handleIceCandidate(msg);
         break;
     }
   }
 
-  // ---------- WebRTC Negotiation (Critical fixes) ----------
+  private shouldInitiate(remotePeerId: string): boolean {
+    return this.peerId < remotePeerId;
+  }
 
-  /**
-   * Create a new RTCPeerConnection for a given remote peer and return it.
-   * Critical fix #2: adds ondatachannel so the answerer side picks up incoming channels.
-   */
+  private async maybeInitiateOffer(peerId: string): Promise<void> {
+    if (!peerId || peerId === this.peerId || !this.shouldInitiate(peerId) || this.peers.has(peerId)) {
+      return;
+    }
+    await this.initiateOffer(peerId);
+  }
+
   private createPeer(peerId: string): RTCPeerConnection {
+    const existing = this.peers.get(peerId);
+    if (existing && existing.signalingState !== 'closed') {
+      return existing;
+    }
+
     const pc = new RTCPeerConnection({
       iceServers: [
         { urls: 'stun:stun.l.google.com:19302' },
@@ -177,14 +189,12 @@ export class ShadowCast {
     };
 
     pc.onconnectionstatechange = () => {
-      if (pc.connectionState === 'failed' || pc.connectionState === 'disconnected') {
+      if (['failed', 'disconnected', 'closed'].includes(pc.connectionState)) {
         this.handlePeerDisconnect(peerId);
       }
     };
 
-    // Critical fix #2: ondatachannel — answerer receives channels created by the offerer
     pc.ondatachannel = (event) => {
-      console.log(`[ShadowCast] ondatachannel from ${peerId}`);
       this.setupDataChannel(event.channel, peerId);
     };
 
@@ -192,16 +202,13 @@ export class ShadowCast {
     return pc;
   }
 
-  /**
-   * Offerer side: create peer, open a data channel, and send an SDP offer.
-   */
   private async initiateOffer(peerId: string): Promise<void> {
     const pc = this.createPeer(peerId);
 
-    // Offerer creates the data channel
-    const dc = pc.createDataChannel('asset-transfer');
-    this.setupDataChannel(dc, peerId);
-    this.dataChannels.set(peerId, dc);
+    if (!this.dataChannels.has(peerId)) {
+      const dc = pc.createDataChannel('asset-transfer');
+      this.setupDataChannel(dc, peerId);
+    }
 
     const offer = await pc.createOffer();
     await pc.setLocalDescription(offer);
@@ -216,14 +223,22 @@ export class ShadowCast {
     );
   }
 
-  /**
-   * Critical fix #1: handle an incoming SDP offer (answerer side).
-   */
   private async handleOffer(msg: Record<string, unknown>): Promise<void> {
     const fromId = msg.from as string;
-    const pc = this.createPeer(fromId);
+    if (!fromId || fromId === this.peerId) return;
 
+    const existing = this.peers.get(fromId);
+    if (existing?.remoteDescription && existing.signalingState === 'stable') {
+      return;
+    }
+
+    if (existing && existing.signalingState !== 'stable' && this.shouldInitiate(fromId)) {
+      return;
+    }
+
+    const pc = this.createPeer(fromId);
     await pc.setRemoteDescription(new RTCSessionDescription(msg.sdp as RTCSessionDescriptionInit));
+
     const answer = await pc.createAnswer();
     await pc.setLocalDescription(answer);
 
@@ -237,32 +252,24 @@ export class ShadowCast {
     );
   }
 
-  /**
-   * Critical fix #1: handle an incoming SDP answer (offerer side).
-   */
   private async handleAnswer(msg: Record<string, unknown>): Promise<void> {
     const pc = this.peers.get(msg.from as string);
-    if (!pc) return;
+    if (!pc || pc.signalingState === 'stable') return;
     await pc.setRemoteDescription(new RTCSessionDescription(msg.sdp as RTCSessionDescriptionInit));
   }
 
-  /**
-   * Critical fix #1: handle an incoming ICE candidate.
-   */
   private async handleIceCandidate(msg: Record<string, unknown>): Promise<void> {
     const pc = this.peers.get(msg.from as string);
     if (!pc || !msg.candidate) return;
     await pc.addIceCandidate(new RTCIceCandidate(msg.candidate as RTCIceCandidateInit));
   }
 
-  // ---------- Data Channel ----------
-
   private setupDataChannel(dc: RTCDataChannel, peerId: string) {
     dc.binaryType = 'arraybuffer';
 
     dc.onopen = () => {
-      console.log(`[ShadowCast] DataChannel open with ${peerId}`);
       this.dataChannels.set(peerId, dc);
+      this.notifyPeerWaiters();
     };
 
     dc.onmessage = (event) => {
@@ -270,58 +277,40 @@ export class ShadowCast {
     };
 
     dc.onclose = () => {
-      console.warn(`[ShadowCast] DataChannel closed with ${peerId}`);
       this.dataChannels.delete(peerId);
-      this.handlePeerDisconnect(peerId);
     };
 
-    // Medium fix: onerror handler on DataChannel
     dc.onerror = (err) => {
       console.error(`[ShadowCast] DataChannel error with ${peerId}:`, err);
     };
   }
 
-  // ---------- Asset Request ----------
-
-  /**
-   * Request an asset, returning a Blob Object URL.
-   * Checks the local cache first, then tries P2P, then falls back to HTTP.
-   * High fix: guards against double-init.
-   */
   async requestAsset(url: string): Promise<string> {
-    // Cache hit
     const cached = this.assetCache.get(url);
     if (cached) return URL.createObjectURL(cached);
 
-    const assetId = btoa(url).replace(/[^a-zA-Z0-9]/g, '').slice(0, 20);
+    await this.connect(this.roomId || DEFAULT_ROOM);
 
-    // Connect if not already connected
-    await this.init(assetId);
+    const assetId = this.getAssetId(url);
+    this.assetUrlsById.set(assetId, url);
 
-    if (this.dataChannels.size > 0) {
-      // We have peers — request over P2P
+    if (await this.waitForPeers({ timeout: 1500 })) {
       return new Promise<string>((resolve) => {
-        this.assetResolvers.set(assetId, resolve);
+        this.assetResolvers.set(assetId, { url, resolve });
         this.requestFromPeers(assetId, url);
 
-        // 5-second timeout before falling back to HTTP
         setTimeout(() => {
           if (this.assetResolvers.has(assetId)) {
             this.assetResolvers.delete(assetId);
-            console.warn('[ShadowCast] P2P timeout — falling back to HTTP for', url);
             this.fallbackToHttp(url).then(resolve);
           }
         }, 5000);
       });
     }
 
-    // No peers available — go straight to HTTP fallback
     return this.fallbackToHttp(url);
   }
 
-  /**
-   * Ask all connected peers to send the asset identified by assetId / url.
-   */
   private requestFromPeers(assetId: string, url: string) {
     const req = JSON.stringify({ type: 'asset-request', assetId, url });
     for (const dc of this.dataChannels.values()) {
@@ -331,24 +320,17 @@ export class ShadowCast {
     }
   }
 
-  // ---------- Chunking (Medium — full implementation) ----------
-
-  /**
-   * Split a Blob into fixed-size ArrayBuffer chunks and send them over a DataChannel.
-   */
   private async sendAssetChunks(dc: RTCDataChannel, assetId: string, blob: Blob): Promise<void> {
     const totalChunks = Math.ceil(blob.size / CHUNK_SIZE);
 
     for (let i = 0; i < totalChunks; i++) {
       const slice = blob.slice(i * CHUNK_SIZE, (i + 1) * CHUNK_SIZE);
       const buffer = await slice.arrayBuffer();
-
-      // Send a JSON metadata frame first, then the raw binary chunk
       const meta: Chunk = {
         index: i,
         total: totalChunks,
         assetId,
-        data: '', // not used for binary path; kept for protocol compat
+        data: '',
       };
 
       if (dc.readyState !== 'open') break;
@@ -356,18 +338,13 @@ export class ShadowCast {
       dc.send(buffer);
     }
 
-    // Signal completion
     if (dc.readyState === 'open') {
       dc.send(JSON.stringify({ type: 'chunk-done', assetId, mimeType: blob.type }));
     }
   }
 
-  /**
-   * Handle incoming data from a peer — either a control message or a binary chunk.
-   */
   private handleIncomingData(data: ArrayBuffer | string, peerId: string) {
     if (typeof data === 'string') {
-      // Control / metadata message
       let msg: Record<string, unknown>;
       try {
         msg = JSON.parse(data);
@@ -377,11 +354,10 @@ export class ShadowCast {
 
       switch (msg.type) {
         case 'asset-request': {
-          // Peer is asking us for an asset we may have cached
           const { assetId, url } = msg as { assetId: string; url: string };
           const blob = this.assetCache.get(url);
           const dc = this.dataChannels.get(peerId);
-          if (blob && dc) {
+          if (blob && dc?.readyState === 'open') {
             this.sendAssetChunks(dc, assetId, blob);
           }
           break;
@@ -389,14 +365,14 @@ export class ShadowCast {
 
         case 'chunk-meta': {
           const { assetId, index, total } = msg as unknown as Chunk & { type: string };
+          this.assetUrlsById.set(assetId, this.assetUrlsById.get(assetId) ?? assetId);
           if (!this.chunkBuffers.has(assetId)) {
             this.chunkBuffers.set(assetId, {
               received: new Map(),
-              total: total,
+              total,
               mimeType: 'application/octet-stream',
             });
           }
-          // Store pending meta so the next binary frame can be associated
           this.pendingChunkMeta.set(peerId, { assetId, index });
           break;
         }
@@ -411,16 +387,11 @@ export class ShadowCast {
           break;
         }
       }
-    } else {
-      // Binary chunk — associate with the most-recently-seen chunk-meta
-      this.storeBinaryChunk(data, peerId);
+      return;
     }
-  }
 
-  /**
-   * Track which chunk index we're expecting next per peer.
-   */
-  private pendingChunkMeta: Map<string, { assetId: string; index: number }> = new Map();
+    this.storeBinaryChunk(data, peerId);
+  }
 
   private storeBinaryChunk(buffer: ArrayBuffer, peerId: string) {
     const meta = this.pendingChunkMeta.get(peerId);
@@ -434,69 +405,97 @@ export class ShadowCast {
     this.tryReassemble(meta.assetId);
   }
 
-  /**
-   * Reassemble chunks into a Blob once all pieces have arrived.
-   */
   private tryReassemble(assetId: string) {
     const buf = this.chunkBuffers.get(assetId);
     if (!buf || buf.received.size < buf.total) return;
 
-    // All chunks received — sort and concatenate
     const parts: ArrayBuffer[] = [];
     for (let i = 0; i < buf.total; i++) {
       const chunk = buf.received.get(i);
-      if (!chunk) return; // still missing a piece
+      if (!chunk) return;
       parts.push(chunk);
     }
 
     const blob = new Blob(parts, { type: buf.mimeType });
+    const pending = this.assetResolvers.get(assetId);
+    const url = pending?.url ?? this.assetUrlsById.get(assetId);
+
+    if (url) {
+      this.assetCache.set(url, blob);
+    }
+
     this.chunkBuffers.delete(assetId);
 
-    // Resolve the pending requestAsset promise
-    const resolver = this.assetResolvers.get(assetId);
-    if (resolver) {
+    if (pending) {
       this.assetResolvers.delete(assetId);
-
-      // Reverse-lookup url from assetId is tricky; for now store the object URL directly
-      // and cache by assetId as key (callers can use the returned object URL)
-      resolver(URL.createObjectURL(blob));
+      pending.resolve(URL.createObjectURL(blob));
     }
   }
 
-  // ---------- HTTP Fallback (High fix) ----------
-
-  /**
-   * High fix: actually fetch the asset over HTTP, cache it as a Blob,
-   * and return a Blob Object URL instead of the bare URL.
-   */
   private async fallbackToHttp(url: string): Promise<string> {
-    console.log('[ShadowCast] HTTP fallback for', url);
     const response = await fetch(url);
     if (!response.ok) {
       throw new Error(`[ShadowCast] HTTP fallback failed: ${response.status} ${url}`);
     }
     const blob = await response.blob();
-    this.assetCache.set(url, blob); // cache for future peers
+    this.assetCache.set(url, blob);
     return URL.createObjectURL(blob);
   }
 
-  // ---------- Peer lifecycle ----------
-
   private handlePeerDisconnect(peerId: string) {
-    console.warn(`[ShadowCast] Peer disconnected: ${peerId}`);
-    this.peers.get(peerId)?.close();
-    this.peers.delete(peerId);
+    const dc = this.dataChannels.get(peerId);
+    if (dc && dc.readyState !== 'closed') {
+      dc.close();
+    }
     this.dataChannels.delete(peerId);
+
+    const pc = this.peers.get(peerId);
+    if (pc && pc.signalingState !== 'closed') {
+      pc.close();
+    }
+    this.peers.delete(peerId);
+    this.pendingChunkMeta.delete(peerId);
   }
 
-  // ---------- Cleanup ----------
-
-  destroy() {
-    this.signalingWs?.close();
+  private cleanupMesh() {
+    const ws = this.signalingWs;
     this.signalingWs = null;
-    for (const pc of this.peers.values()) pc.close();
+    ws?.close();
+
+    for (const peerId of this.peers.keys()) {
+      this.handlePeerDisconnect(peerId);
+    }
+
     this.peers.clear();
     this.dataChannels.clear();
+    this.pendingChunkMeta.clear();
     this.initialized = false;
+  }
+
+  private hasOpenDataChannel(): boolean {
+    for (const dc of this.dataChannels.values()) {
+      if (dc.readyState === 'open') return true;
+    }
+    return false;
+  }
+
+  private notifyPeerWaiters() {
+    if (!this.hasOpenDataChannel()) return;
+    for (const waiter of this.peerWaiters) {
+      waiter();
+    }
+    this.peerWaiters.clear();
+  }
+
+  private getAssetId(url: string): string {
+    return btoa(url).replace(/[^a-zA-Z0-9]/g, '').slice(0, 20);
+  }
+
+  destroy() {
+    this.cleanupMesh();
+    this.chunkBuffers.clear();
+    this.assetResolvers.clear();
+    this.assetUrlsById.clear();
+    this.peerWaiters.clear();
   }
 }
